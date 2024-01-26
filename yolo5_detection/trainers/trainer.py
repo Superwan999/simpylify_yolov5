@@ -1,5 +1,5 @@
 import random
-
+import os
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -45,17 +45,23 @@ class Trainer:
 
         self.current_iter = 0
         self.total_iters = self.opt['max_iters']
-
         self.total_epochs = self.opt['epochs']
 
-        self.model = Model(self.opt['model_cfg']).to(self.device)
+        self.model = Model(self.opt['model_cfg'])
+        if self.opt['pretrained']:
+            state_dict = self.load_model_weights()
+            if state_dict is not None:
+                print("==================> Loading pretrained model weights")
+                self.model.load_state_dict(state_dict)
+
+        self.model = self.model.to(self.device)
         self.model = self.model_to_device(self.model)
 
         self.grid_size = max(int(self.model.stride.max()), 32)
         self.img_size = check_img_size(self.opt['img_size'], self.grid_size, floor=self.grid_size * 2)
 
         self.compute_loss = ComputeLoss(self.model)
-        self.stopper = EarlyStopping(patience=self.opt['train']['patience'])
+        self.stopper = EarlyStopping(patience=self.opt['patience'])
         self.optimizer = create_optimizer(self.model,
                                           name=self.opt['optimizer']['name'],
                                           lr=self.opt['optimizer']['lr'],
@@ -63,10 +69,11 @@ class Trainer:
                                           decay=self.opt['optimizer']['decay'])
 
         self.train_dataset = DetectionDataSet(path=self.opt['dataset']['train']['path'],
-                                              img_size=self.opt['dataset']['train']['img_size'],
-                                              hyp=self.opt['dataset']['train']['hyp'],
-                                              rect=self.opt['dataset']['train']['rect'],
-                                              image_weights=self.opt['dataset']['train']['image_weights']
+                                              img_size=self.opt['img_size'],
+                                              augment=self.opt['augment'],
+                                              hyp=self.opt['hyp'],
+                                              rect=self.opt['rect'],
+                                              image_weights=self.opt['image_weights']
                                               )
         self.train_sampler = EnlargedSampler(self.train_dataset, self.opt['world_size'], self.opt['rank'], 1)
         self.train_loader = create_dataloader(self.train_dataset,
@@ -75,10 +82,11 @@ class Trainer:
                                               seed=self.opt['dataset']['train']['seed'])
 
         self.valid_dataset = DetectionDataSet(path=self.opt['dataset']['val']['path'],
-                                              img_size=self.opt['dataset']['val']['img_size'],
-                                              hyp=self.opt['dataset']['val']['hyp'],
-                                              rect=self.opt['dataset']['val']['rect'],
-                                              image_weights=self.opt['dataset']['val']['image_weights']
+                                              img_size=self.opt['img_size'],
+                                              augment=False,
+                                              hyp=self.opt['hyp'],
+                                              rect=True,
+                                              image_weights=False
                                               )
         self.valid_loader = create_dataloader(self.valid_dataset,
                                               sampler=None,
@@ -113,7 +121,9 @@ class Trainer:
         return loss_items
 
     def train(self):
+        self.train_init_setting()
         self.model.train()
+
         if self.opt['image_weights']:
             class_w = self.model.class_weights.cpu().numpy() * (1 - self.maps) ** 2 / self.nc  # class weights
             image_w = labels_to_image_weights(self.train_dataset.labels, nc=self.nc, class_weights=class_w)  # image weights
@@ -135,7 +145,7 @@ class Trainer:
 
                 if self.current_iter % self.opt['logger']['save_checkpoint_freq'] == 0:
                     print(f"Saving models and training state.")
-                    self.model.save(epoch, self.current_iter)
+                    self.save_weights(epoch, self.current_iter)
 
                 if self.current_iter % self.opt['val']['val_freq'] == 0:
                     print(f"epoch: {epoch}, current iters: {self.current_iter}, Validation =====>:.")
@@ -290,12 +300,27 @@ class Trainer:
             model = DataParallel(model)
         return model
 
+    def save_weights(self, epoch, current_iter):
+        save_file_path = self.opt['save_file']
+        os.makedirs(save_file_path, exist_ok=True)
+        save_weights_path = os.path.join(save_file_path, 'model_weights')
+        os.makedirs(save_weights_path, exist_ok=True)
+        filename = f"{epoch}_{current_iter}.pth"
+        save_path = os.path.join(save_weights_path, filename)
 
-    def save(self):
-        pass
+        state_dict = self.model.state_dict()
+        for name, weights in state_dict.items():
+            if name.startswith('module.'):
+                name = name[7:]
+            state_dict[name] = weights.cpu()
 
-    def load_model_dict(self):
-        pass
+        torch.save(state_dict, save_path)
 
-    def load_state_dict(self):
-        pass
+    def load_model_weights(self):
+        w_path = self.opt['pretrained_weights']
+        if w_path is None:
+            print("Warning: model pretrained weights path not exists!")
+            return None
+        print(f"==========> Loading checkpoint:{w_path}")
+        ckpt = torch.load(w_path, map_location='cpu')
+        return ckpt
